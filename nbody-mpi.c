@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <mpi.h>
 
 /* Constants */
 
@@ -134,6 +135,8 @@ static void integrate(body_t *body, float delta_time)
 
 int main(int argc, char **argv)
 {
+    MPI_Init(&argc, &argv);
+
     if (argc < 6) {
         fprintf(
             stderr,
@@ -147,8 +150,13 @@ int main(int argc, char **argv)
             argv[0]
         );
 
+        MPI_Finalize();
         return EXIT_FAILURE;
     }
+
+    int world_size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     float time_period = strtof(argv[1], NULL);
     float delta_time  = strtof(argv[2], NULL);
@@ -161,34 +169,58 @@ int main(int argc, char **argv)
         debug_acceleration_scale = strtof(argv[6], NULL);
     }
 
-    bodies = (body_t *) malloc(sizeof(*bodies) * body_count);
+    size_t mpi_body_count = body_count + (body_count % world_size ? world_size - body_count % world_size : 0);
+
+    bodies = (body_t *) malloc(sizeof(*bodies) * mpi_body_count);
     assert(bodies != NULL);
-    generate_debug_data(bodies, body_count);
-    printf("%zu\n%f\n%f\n", body_count, time_period, delta_time);
-    for (size_t i = 0; i < body_count; ++i) {
-        body_t *body = &bodies[i];
-        printf(
-            "%f %f\n"
-            "%f %f\n"
-            "%f %f\n"
-            "%f\n",
-            body->x,  body->y,
-            body->ax, body->ay,
-            body->vx, body->vy,
-            body->mass
-        );
-    }
 
     size_t iterations = time_period / delta_time;
     size_t acceleration_entries = iterations * body_count * 2;
-    accelerations = (float *) malloc(sizeof(*accelerations) * acceleration_entries);
-    assert(accelerations != NULL);
+
+    MPI_Datatype mpi_dt_body;
+    MPI_Type_contiguous(7, MPI_FLOAT, &mpi_dt_body);
+    MPI_Type_commit(&mpi_dt_body);
+
+    if (rank == 0) {
+        generate_debug_data(bodies, body_count);
+
+        printf("%zu\n%f\n%f\n", body_count, time_period, delta_time);
+        for (size_t i = 0; i < body_count; ++i) {
+            body_t *body = &bodies[i];
+            printf(
+                "%f %f\n"
+                "%f %f\n"
+                "%f %f\n"
+                "%f\n",
+                body->x,  body->y,
+                body->ax, body->ay,
+                body->vx, body->vy,
+                body->mass
+            );
+        }
+
+        accelerations = (float *) malloc(sizeof(*accelerations) * acceleration_entries);
+        assert(accelerations != NULL);
+    }
+
+    assert(body_count % world_size == 0);
+    size_t bodies_per_process = body_count / world_size;
+    body_t *sub_bodies = (body_t *) malloc(sizeof(body_t) * bodies_per_process);
+    assert(sub_bodies != NULL);
+
 
     for (size_t k = 0, next_acceleration = 0; k < iterations; ++k) {
 #ifdef DEBUG
         print_progress_bar((float) (k + 1) / iterations);
 #endif
-        for (size_t i = 0; i < body_count; ++i) {
+        MPI_Bcast(bodies, body_count, mpi_dt_body, 0, MPI_COMM_WORLD);
+        size_t begin = rank * bodies_per_process;
+        size_t end = begin + bodies_per_process - 1;
+        if (end >= body_count) {
+            end = body_count - 1;
+        }
+
+        for (size_t i = begin, sub_i = 0; i <= end; ++i, ++sub_i) {
             body_t *first_body = &bodies[i];
 
             float total_ax = 0.0f, total_ay = 0.0f;
@@ -208,22 +240,27 @@ int main(int argc, char **argv)
                 total_ay += ay;
             }
 
-            first_body->ax = total_ax;
-            first_body->ay = total_ay;
+            sub_bodies[sub_i] = *first_body;
+            sub_bodies[sub_i].ax = total_ax;
+            sub_bodies[sub_i].ay = total_ay;
         }
+        
+        MPI_Gather(sub_bodies, bodies_per_process, mpi_dt_body, bodies, bodies_per_process, mpi_dt_body, 0, MPI_COMM_WORLD);
 
-        for (size_t i = 0; i < body_count; ++i) {
-            body_t *body = &bodies[i];
-
-            integrate(body, delta_time);
-
-            accelerations[next_acceleration++] = body->ax;
-            accelerations[next_acceleration++] = body->ay;
+        if (rank == 0) {
+            for (size_t i = 0; i < body_count; ++i) {
+                body_t *body = &bodies[i];
+                integrate(body, delta_time);
+                accelerations[next_acceleration++] = body->ax;
+                accelerations[next_acceleration++] = body->ay;
+            }
         }
     }
 
-    for (size_t i = 0; i < acceleration_entries; i += 2) {
-        printf("%f %f\n", accelerations[i], accelerations[i + 1]);
+    if (rank == 0) {
+        for (size_t i = 0; i < acceleration_entries; i += 2) {
+            printf("%f %f\n", accelerations[i], accelerations[i + 1]);
+        }
     }
 
     free(accelerations);
@@ -232,6 +269,10 @@ int main(int argc, char **argv)
     free(bodies);
     bodies = NULL;
 
+    free(sub_bodies);
+    sub_bodies = NULL;
+
+    MPI_Finalize();
     return EXIT_SUCCESS;
 }
 
